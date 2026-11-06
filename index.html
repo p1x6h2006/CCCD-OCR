@@ -40,7 +40,7 @@ input[type=text]{width:100%;padding:9px;border:1px solid var(--ln);border-radius
     <button id="bStart" disabled>Bật camera</button>
     <button id="bRead" disabled>Chốt và đọc</button>
     <label class="file" style="margin:0">Tải ảnh lên<input id="up" type="file" accept="image/*" hidden></label>
-    <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="auto" type="checkbox" checked> Tự động đọc khi thẻ đứng yên</label>
+    <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="auto" type="checkbox" checked> Tự động đọc khi thấy thẻ</label>
     <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="autoReg" type="checkbox"> Tự đăng ký khi đọc đủ</label>
   </div>
 </section>
@@ -61,12 +61,13 @@ const CARD_MODEL = 'models/card_best.onnx', CARD_SZ = 640;
 const FIELD_MODEL = 'models/field_best.onnx', FIELD_SZ = 960;
 const REC_MODEL = 'models/rec.onnx', REC_DICT = 'models/rec_dict.txt';   // PaddleOCR PP-OCRv3 rec (ONNX) + bảng ký tự
 const FIELDS = ['id', 'name', 'dob'];          // thứ tự class của field_best.pt
-const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 4;
+const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 2;      // chỉ cần thẻ không bị xê dịch mạnh trong 2 lần dò liên tiếp (cho phép tay run nhẹ)
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
+let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, pr = null, big = false, bfReady = false, bestQ = null, bestScore = 0, bestT = 0, lastSharp = 0, stable = 0, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
+const bf = document.createElement('canvas');   // khung nét nhất trong khoảng ngay trước khi đọc
 
 ort.env.wasm.numThreads = 1;                   // không cần cross-origin isolation (chạy được trên GitHub Pages)
 
@@ -79,6 +80,12 @@ async function init() {
     chars = ['', ...(await (await fetch(REC_DICT)).text()).split('\n'), ' '];   // 0 = blank, cuối = dấu cách
     const idx = set => [0, ...[...chars.keys()].filter(i => i && set.includes(chars[i]))];
     AL.digit = idx('0123456789'); AL.dob = idx('0123456789/'); AL.upper = idx('ABCDEFGHIJKLMNOPQRSTUVWXYZ ');
+    st('Đang khởi động mô hình...');
+    try {   // chạy thử 1 lần để lần đọc đầu tiên không bị chậm
+      const z = S => new ort.Tensor('float32', new Float32Array(3 * S * S), [1, 3, S, S]);
+      await cardS.run({ [cardS.inputNames[0]]: z(CARD_SZ) }); await fieldS.run({ [fieldS.inputNames[0]]: z(FIELD_SZ) });
+      await recS.run({ [recS.inputNames[0]]: new ort.Tensor('float32', new Float32Array(3 * 48 * 160), [1, 3, 48, 160]) });
+    } catch (e) {}
     st('Sẵn sàng. Bật camera hoặc tải ảnh lên.');
     $('bStart').disabled = false;
     toggleCam();   // tự bật camera khi mở trang
@@ -98,7 +105,7 @@ function letterbox(src, sw, sh, S) {
   g.drawImage(src, dx, dy, w, h);
   const d = g.getImageData(0, 0, S, S).data, n = S * S, f = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) { f[i] = d[4 * i] / 255; f[n + i] = d[4 * i + 1] / 255; f[2 * n + i] = d[4 * i + 2] / 255; }
-  return { t: new ort.Tensor('float32', f, [1, 3, S, S]), r, dx, dy };
+  return { t: new ort.Tensor('float32', f, [1, 3, S, S]), r, dx, dy, px: d };
 }
 
 // ---------- 1. tìm thẻ bằng YOLO-seg ----------
@@ -168,6 +175,14 @@ async function detectCard(src, sw, sh) {
   }
   const r = rectFit(v, pw, Math.max(w, h) * f * 1.1);
   if (!r || r.fill < 0.3) return null;               // mặt nạ quá rời rạc -> coi như chưa thấy thẻ
+  {   // độ nét của vùng thẻ (trung bình độ chênh lệch giữa điểm ảnh kề nhau); khung bị nhòe do rung tay sẽ có điểm thấp
+    const xs = r.pts.map(p => p[0] / f), ys = r.pts.map(p => p[1] / f), px = L.px, W = CARD_SZ;
+    const xa = Math.max(1, Math.floor(Math.min(...xs))), xb = Math.min(W - 2, Math.ceil(Math.max(...xs)));
+    const ya = Math.max(1, Math.floor(Math.min(...ys))), yb = Math.min(W - 2, Math.ceil(Math.max(...ys)));
+    let sum = 0, cnt = 0;
+    for (let y = ya; y < yb; y += 2) for (let x = xa; x < xb; x += 2) { const i = 4 * (y * W + x) + 1; sum += Math.abs(px[i] - px[i + 4]) + Math.abs(px[i] - px[i + 4 * W]); cnt++; }
+    lastSharp = cnt ? sum / cnt : 0;
+  }
   return r.pts.map(([x, y]) => [(x / f - L.dx) / L.r, (y / f - L.dy) / L.r]);
 }
 
@@ -223,7 +238,10 @@ function score(b) {
 async function fixOrientation(card) {
   const r = document.createElement('canvas'); r.width = CW; r.height = CH;
   const g = r.getContext('2d'); g.translate(CW, CH); g.rotate(Math.PI); g.drawImage(card, 0, 0);
-  const [a, b] = [await detectFields(card), await detectFields(r)];
+  const a = await detectFields(card);
+  const good = a.id && a.name && a.dob && a.id.y < a.name.y && a.name.y < a.dob.y && a.id.s + a.name.s + a.dob.s > 1.5;
+  if (good) return [card, a];                        // đúng chiều rồi, khỏi tốn thêm một lần chạy mô hình
+  const b = await detectFields(r);
   return score(b) > score(a) ? [r, b] : [card, a];
 }
 
@@ -380,19 +398,28 @@ async function readCard(frame, q, auto) {
     const out = $('out'); out.width = CW; out.height = CH; out.style.display = 'block';
     const g = out.getContext('2d'); g.drawImage(card, 0, 0); g.lineWidth = 3;
     const col = { id: '#e53935', name: '#2e7d32', dob: '#1e63d6' }, cand = { id: [], name: [], dob: [] };
-    for (const k of FIELDS) {
-      const f = boxes[k]; if (!f) continue;
-      g.strokeStyle = col[k]; g.strokeRect(f.x, f.y, f.w, f.h);
-      st('Đang đọc: ' + k + '...');
-      for (const v of PADS) for (const bin of [0, 3]) {
-        const c = prep(card, f, bin, v);
+    for (const k of FIELDS) { const f = boxes[k]; if (f) { g.strokeStyle = col[k]; g.strokeRect(f.x, f.y, f.w, f.h); } }
+    // Đọc theo từng lượt (kiểu cắt x kiểu ảnh). Sau từ lượt thứ 2, nếu các kết quả đã trùng nhau và hợp lệ thì dừng sớm cho nhanh.
+    const rounds = []; for (const pv of PADS) for (const bin of [0, 3]) rounds.push([pv, bin]);
+    let val, nameConf = 0;
+    for (let ri = 0; ri < rounds.length; ri++) {
+      st('Đang đọc... (' + (ri + 1) + '/' + rounds.length + ')');
+      const [pv, bin] = rounds[ri];
+      for (const k of FIELDS) {
+        const f = boxes[k]; if (!f) continue;
+        const c = prep(card, f, bin, pv);
         if (k === 'name') {
-          cand.name.push(cleanName((await recognize(c, null)).text), cleanName((await recognize(c, AL.upper)).text));
+          const a1 = await recognize(c, null), a2 = await recognize(c, AL.upper);
+          cand.name.push(cleanName(a1.text), cleanName(a2.text)); nameConf = Math.max(nameConf, a1.conf, a2.conf);
         } else if (k === 'id') cand.id.push(...idCands((await recognize(c, AL.digit)).text));
         else cand.dob.push(parseDob((await recognize(c, AL.dob)).text));
       }
+      val = choose({ id: [...cand.id], dob: [...cand.dob], name: [...cand.name] });   // bản sao: choose() có chèn thêm ứng viên bỏ phiếu
+      const nameOk = val.name.split(' ').length >= 2 && (val.name.split(' ').every(w => NAME_WORDS.has(w)) || nameConf >= 0.93);
+      const agree = x => cand.id.filter(y => y === val.id).length >= 2 && cand.dob.filter(y => y === val.dob).length >= 2 && x;
+      if (ri >= 1 && agree(consistent(val.id, val.dob) && nameOk)) break;
     }
-    const val = choose(cand);
+
     $('fn').value = val.name; $('fi').value = val.id; $('fd').value = val.dob;
     const w = [];
     if (val.id.length !== 12) w.push('số CCCD chưa đủ 12 chữ số');
@@ -413,24 +440,33 @@ async function readCard(frame, q, auto) {
   busy = false; $('bRead').disabled = !live;
 }
 
-// ---------- vòng lặp camera: phát hiện thẻ ~6 lần/giây, vẽ khung, theo dõi độ ổn định ----------
+// ---------- vòng lặp camera: dò thẻ liên tục, vẽ khung, chọn khung nét nhất rồi tự đọc ----------
 function grab() { fc.width = v.videoWidth; fc.height = v.videoHeight; fc.getContext('2d').drawImage(v, 0, 0); }
 async function loop() {
   if (!live) return;
   if (!busy && v.readyState >= 2) {
     busy = true;
     try {
-      let raw = await detectCard(v, v.videoWidth, v.videoHeight);
-      const diag = Math.hypot(v.videoWidth, v.videoHeight);
-      if (raw) {
+      const det = await detectCard(v, v.videoWidth, v.videoHeight);
+      let raw = det;
+      if (det) {
         miss = 0;
-        if (prev) {
-          const mv = raw.reduce((t, p, i) => t + Math.hypot(p[0] - prev[i][0], p[1] - prev[i][1]), 0) / 4 / diag;
-          stable = mv < 0.015 ? stable + 1 : 0;
-          if (mv < 0.05) raw = raw.map((p, i) => [prev[i][0] * .5 + p[0] * .5, prev[i][1] * .5 + p[1] * .5]);   // làm mượt, bớt rung
+        const cw = Math.hypot(det[1][0] - det[0][0], det[1][1] - det[0][1]);
+        big = cw >= 0.28 * v.videoWidth;                // thẻ đủ lớn mới tự đọc
+        if (pr) {   // độ xê dịch so với lần dò trước, tính theo bề rộng thẻ: dưới 10% là "chưa di chuyển mạnh", tay run nhẹ vẫn qua
+          const mv = det.reduce((t, p, i) => t + Math.hypot(p[0] - pr[i][0], p[1] - pr[i][1]), 0) / 4 / cw;
+          stable = mv < 0.10 ? stable + 1 : 0;
+          if (prev && mv < 0.3) raw = det.map((p, i) => [prev[i][0] * .5 + p[0] * .5, prev[i][1] * .5 + p[1] * .5]);   // chỉ để vẽ cho đỡ rung
         } else stable = 0;
+        pr = det;
+        // giữ lại khung nét nhất trong ~0.7 giây gần nhất; khi đọc sẽ dùng khung này thay vì khung đúng lúc bấm
+        const now = Date.now();
+        if (big && (!bfReady || lastSharp > bestScore || now - bestT > 700)) {
+          if (bf.width !== v.videoWidth || bf.height !== v.videoHeight) { bf.width = v.videoWidth; bf.height = v.videoHeight; }
+          bf.getContext('2d').drawImage(v, 0, 0); bestQ = det; bestScore = lastSharp; bestT = now; bfReady = true;
+        }
       } else if (prev && ++miss <= 2) raw = prev;      // rớt 1-2 khung thì giữ khung cũ, tránh nhấp nháy
-      else stable = 0;
+      else { stable = 0; pr = null; }
       quad = prev = raw;
     } catch (e) { quad = null; }
     busy = false;
@@ -438,14 +474,16 @@ async function loop() {
     const g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height);
     if (quad) {
       lastSeen = Date.now();
-      const big = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]) >= 0.28 * v.videoWidth;   // thẻ đủ lớn mới tự đọc
       const ok = stable >= STABLE_NEED && big;
       g.strokeStyle = ok ? '#2ee59d' : '#ffc43d'; g.lineWidth = Math.max(3, ov.width / 300);
       g.beginPath(); quad.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); g.stroke();
       const rd = Math.max(5, ov.width / 180); g.fillStyle = g.strokeStyle; quad.forEach(([x, y]) => { g.beginPath(); g.arc(x, y, rd, 0, 7); g.fill(); });   // chấm 4 góc
       if (!armed && $('auto').checked) st(lastOk ? 'Đã đọc xong. Bỏ thẻ ra khỏi khung để đọc thẻ khác.' : $('st').textContent);
-      else st(!big ? 'Đưa thẻ lại gần hơn.' : ok ? ($('auto').checked ? 'Thẻ đã ổn định, đang tự đọc...' : 'Thẻ đã ổn định, sẵn sàng đọc.') : 'Giữ thẻ đứng yên...');
-      if (ok && armed && $('auto').checked && Date.now() - lastAuto > 2500) { lastAuto = Date.now(); stable = 0; grab(); readCard(fc, quad, true); }
+      else st(!big ? 'Đưa thẻ lại gần hơn.' : ok ? ($('auto').checked ? 'Đang tự đọc...' : 'Sẵn sàng đọc.') : 'Giữ thẻ trong khung...');
+      if (ok && armed && $('auto').checked && Date.now() - lastAuto > 1500 && bfReady) {
+        lastAuto = Date.now(); stable = 0; bfReady = false; bestScore = 0;
+        readCard(bf, bestQ, true);   // đọc từ khung nét nhất cùng 4 góc của chính khung đó
+      }
     } else {
       if (Date.now() - lastSeen > 1000) { armed = true; tries = 0; }   // thẻ rời khung hơn 1 giây -> sẵn sàng đọc thẻ mới
       st('Đưa CCCD vào khung hình.');
@@ -462,7 +500,7 @@ async function toggleCam() {
   } catch (e) { st('Không mở được camera: ' + e.message + ' (cần HTTPS hoặc localhost và quyền camera).'); }
 }
 $('bStart').onclick = toggleCam;
-$('bRead').onclick = () => { if (!quad) return st('Chưa thấy thẻ.'); grab(); readCard(fc, quad); };
+$('bRead').onclick = () => { if (!quad) return st('Chưa thấy thẻ.'); if (bfReady) { bfReady = false; readCard(bf, bestQ); } else { grab(); readCard(fc, quad); } };
 $('up').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
   const img = new Image(); img.src = URL.createObjectURL(f); await img.decode();
