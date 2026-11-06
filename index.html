@@ -40,7 +40,8 @@ input[type=text]{width:100%;padding:9px;border:1px solid var(--ln);border-radius
     <button id="bStart" disabled>Bật camera</button>
     <button id="bRead" disabled>Chốt và đọc</button>
     <label class="file" style="margin:0">Tải ảnh lên<input id="up" type="file" accept="image/*" hidden></label>
-    <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="auto" type="checkbox"> Tự đọc khi thẻ đứng yên</label>
+    <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="auto" type="checkbox" checked> Tự động đọc khi thẻ đứng yên</label>
+    <label style="margin:0;display:flex;gap:6px;align-items:center"><input id="autoReg" type="checkbox"> Tự đăng ký khi đọc đủ</label>
   </div>
 </section>
 
@@ -64,7 +65,7 @@ const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 6;
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, recS, chars = [], AL = {},  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
+let cardS, fieldS, recS, chars = [], AL = {}, armed = true, noCard = 0, tries = 0, lastOk = false,  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
 
 ort.env.wasm.numThreads = 1;                   // không cần cross-origin isolation (chạy được trên GitHub Pages)
@@ -80,6 +81,7 @@ async function init() {
     AL.digit = idx('0123456789'); AL.dob = idx('0123456789/'); AL.upper = idx('ABCDEFGHIJKLMNOPQRSTUVWXYZ ');
     st('Sẵn sàng. Bật camera hoặc tải ảnh lên.');
     $('bStart').disabled = false;
+    toggleCam();   // tự bật camera khi mở trang
   } catch (e) {
     st('Không tải được mô hình: ' + e.message + '. Mở bằng http://localhost hoặc GitHub Pages, và kiểm tra thư mục models/.');
   }
@@ -330,7 +332,7 @@ function choose(c) {      // chọn tổ hợp (số, ngày sinh) hợp lệ và
   return { id: best.id, dob: best.dob, name };
 }
 
-async function readCard(frame, q) {
+async function readCard(frame, q, auto) {
   busy = true; $('bRead').disabled = true;
   try {
     st('Đang nắn phẳng thẻ...');
@@ -360,7 +362,14 @@ async function readCard(frame, q) {
     const miss = FIELDS.filter(k => !boxes[k]);
     st(miss.length ? 'Không thấy vùng: ' + miss.join(', ') + '. Hãy nhập tay hoặc chụp lại.'
       : w.length ? 'Đã đọc nhưng cần kiểm tra: ' + w.join('; ') + '.' : 'Xong. Kiểm tra và sửa nếu cần.');
-  } catch (e) { st('Lỗi: ' + e.message); }
+    lastOk = !miss.length && !w.length;
+    if (lastOk) {                       // đọc đủ và hợp lệ: dừng tự đọc cho tới khi bỏ thẻ ra khỏi khung
+      armed = false; tries = 0;
+      if ($('autoReg').checked) $('bOk').onclick();
+    } else if (auto && ++tries >= 3) {  // tự thử tối đa 3 lần rồi dừng
+      armed = false; st($('st').textContent + ' Đã thử 3 lần: hãy nhập tay, hoặc bỏ thẻ ra rồi đưa vào lại gần hơn.');
+    }
+  } catch (e) { lastOk = false; st('Lỗi: ' + e.message); }
   busy = false; $('bRead').disabled = !live;
 }
 
@@ -380,23 +389,29 @@ async function loop() {
     ov.width = v.videoWidth; ov.height = v.videoHeight;
     const g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height);
     if (quad) {
+      noCard = 0;
       const ok = stable >= STABLE_NEED;
       g.strokeStyle = ok ? '#2ee59d' : '#ffc43d'; g.lineWidth = Math.max(3, ov.width / 300);
       g.beginPath(); quad.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); g.stroke();
-      st(ok ? 'Thẻ đã ổn định, sẵn sàng đọc.' : 'Giữ thẻ đứng yên...');
-      if (ok && $('auto').checked && Date.now() - lastAuto > 6000) { lastAuto = Date.now(); stable = 0; grab(); readCard(fc, quad); }
-    } else st('Đưa CCCD vào khung hình.');
+      if (!armed && $('auto').checked) st(lastOk ? 'Đã đọc xong. Bỏ thẻ ra khỏi khung để đọc thẻ khác.' : $('st').textContent);
+      else st(ok ? ($('auto').checked ? 'Thẻ đã ổn định, đang tự đọc...' : 'Thẻ đã ổn định, sẵn sàng đọc.') : 'Giữ thẻ đứng yên...');
+      if (ok && armed && $('auto').checked && Date.now() - lastAuto > 2500) { lastAuto = Date.now(); stable = 0; grab(); readCard(fc, quad, true); }
+    } else {
+      if (++noCard >= 8) { armed = true; tries = 0; }   // thẻ rời khung ~1 giây -> sẵn sàng đọc thẻ mới
+      st('Đưa CCCD vào khung hình.');
+    }
   }
   setTimeout(loop, 120);
 }
 
-$('bStart').onclick = async () => {
+async function toggleCam() {
   if (live) { v.srcObject.getTracks().forEach(t => t.stop()); live = false; $('bStart').textContent = 'Bật camera'; $('bRead').disabled = true; return; }
   try {
     v.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     await v.play(); live = true; $('bStart').textContent = 'Tắt camera'; $('bRead').disabled = false; loop();
   } catch (e) { st('Không mở được camera: ' + e.message + ' (cần HTTPS hoặc localhost và quyền camera).'); }
-};
+}
+$('bStart').onclick = toggleCam;
 $('bRead').onclick = () => { if (!quad) return st('Chưa thấy thẻ.'); grab(); readCard(fc, quad); };
 $('up').onchange = async e => {
   const f = e.target.files[0]; if (!f) return;
