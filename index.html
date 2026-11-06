@@ -224,12 +224,15 @@ function otsu(g) {
   }
   return t;
 }
-function padBox(f) {      // nới khung: 12% chiều rộng + 8px hai bên, 25% chiều cao + 4px trên dưới
-  const px = f.w * 0.12 + 8, py = f.h * 0.25 + 4, x = Math.max(0, f.x - px), y = Math.max(0, f.y - py);
-  return { x, y, w: Math.min(CW - x, f.w + 2 * px), h: Math.min(CH - y, f.h + 2 * py) };
+// Khung YOLO thường cắt cụt đuôi chữ (vd mất "ANH") nhưng nới theo chiều dọc sẽ kéo cả dòng nhãn nhỏ phía trên vào -> OCR đọc sai.
+// Vì vậy nới nhiều theo chiều ngang (nhất là bên phải) và gần như không nới theo chiều dọc; thử 2 kiểu cắt.
+const PADS = [{ l: .08, r: .25, y: 0 }, { l: .12, r: .12, y: 2 }];
+function padBox(f, v) {
+  const pl = f.w * v.l + 4, pr = f.w * v.r + 8, x = Math.max(0, f.x - pl), y = Math.max(0, f.y - v.y);
+  return { x, y, w: Math.min(CW - x, f.w + pl + pr), h: Math.min(CH - y, f.h + 2 * v.y) };
 }
-function prep(card, f, bin) {
-  const p = padBox(f), x = Math.floor(p.x), y = Math.floor(p.y), w = Math.ceil(p.w), h = Math.ceil(p.h);
+function prep(card, f, bin, v) {
+  const p = padBox(f, v), x = Math.floor(p.x), y = Math.floor(p.y), w = Math.ceil(p.w), h = Math.ceil(p.h);
   const k = Math.min(4, Math.max(1.5, 110 / h)), B = 14, cw = Math.round(w * k), ch = Math.round(h * k);
   const c = document.createElement('canvas'); c.width = cw + 2 * B; c.height = ch + 2 * B;
   const g = c.getContext('2d', { willReadFrequently: true });
@@ -319,8 +322,10 @@ function choose(c) {      // chọn tổ hợp (số, ngày sinh) hợp lệ và
     if (s > best.s) best = { id: i, dob: d, s };
   }
   let name = '', bs = -1e9;
-  for (const n of c.name) { const s = nameScore(n); if (s > bs) { bs = s; name = n; } }
-  if (SNAP_NAMES) name = name.split(' ').map(w => w.length > 6 ? segment(w) : w).join(' ');   // tách các từ bị dính liền
+  for (const raw of c.name) {
+    const n = raw.split(' ').map(w => SNAP_NAMES && w.length >= 6 ? segment(w) : w).join(' ');   // vd DUCANH -> DUC ANH
+    const s = nameScore(n); if (s > bs) { bs = s; name = n; }
+  }
   if (SNAP_NAMES) name = name.split(' ').map((w, i) => snapToken(w, i)).join(' ');
   return { id: best.id, dob: best.dob, name };
 }
@@ -337,8 +342,8 @@ async function readCard(frame, q) {
       const f = boxes[k]; if (!f) continue;
       g.strokeStyle = col[k]; g.strokeRect(f.x, f.y, f.w, f.h);
       st('Đang đọc: ' + k + '...');
-      for (const bin of [0, 3]) {
-        const c = prep(card, f, bin);
+      for (const v of PADS) for (const bin of [0, 3]) {
+        const c = prep(card, f, bin, v);
         if (k === 'name') {
           cand.name.push(cleanName((await recognize(c, null)).text), cleanName((await recognize(c, AL.upper)).text));
         } else if (k === 'id') cand.id.push(...idCands((await recognize(c, AL.digit)).text));
