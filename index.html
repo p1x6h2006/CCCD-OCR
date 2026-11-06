@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Đọc CCCD bằng camera</title>
 <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
 :root{--bg:#f6f7f4;--fg:#1c2220;--pn:#fff;--ln:#d9ddd6;--ac:#0b6e4f;--mu:#667069}
 @media(prefers-color-scheme:dark){:root{--bg:#151a18;--fg:#e8ece9;--pn:#1d2321;--ln:#323b37;--ac:#4fd1a1;--mu:#9aa6a0}}
@@ -59,12 +58,13 @@ input[type=text]{width:100%;padding:9px;border:1px solid var(--ln);border-radius
 // Đường dẫn model: xuất bằng `yolo export ... format=onnx`, đặt trong thư mục models/ cạnh file này
 const CARD_MODEL = 'models/card_best.onnx', CARD_SZ = 640;
 const FIELD_MODEL = 'models/field_best.onnx', FIELD_SZ = 960;
+const REC_MODEL = 'models/rec.onnx', REC_DICT = 'models/rec_dict.txt';   // PaddleOCR PP-OCRv3 rec (ONNX) + bảng ký tự
 const FIELDS = ['id', 'name', 'dob'];          // thứ tự class của field_best.pt
 const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 6;
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, wDigit, wVie, quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
+let cardS, fieldS, recS, chars = [], AL = {},  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
 
 ort.env.wasm.numThreads = 1;                   // không cần cross-origin isolation (chạy được trên GitHub Pages)
@@ -74,10 +74,10 @@ async function init() {
     cardS = await ort.InferenceSession.create(CARD_MODEL, { executionProviders: ['wasm'] });
     fieldS = await ort.InferenceSession.create(FIELD_MODEL, { executionProviders: ['wasm'] });
     st('Đang tải bộ nhận dạng chữ...');
-    wDigit = await Tesseract.createWorker('eng');
-    await wDigit.setParameters({ tessedit_pageseg_mode: '7' });
-    wVie = await Tesseract.createWorker('vie');
-    await wVie.setParameters({ tessedit_pageseg_mode: '7' });
+    recS = await ort.InferenceSession.create(REC_MODEL, { executionProviders: ['wasm'] });
+    chars = ['', ...(await (await fetch(REC_DICT)).text()).split('\n'), ' '];   // 0 = blank, cuối = dấu cách
+    const idx = set => [0, ...[...chars.keys()].filter(i => i && set.includes(chars[i]))];
+    AL.digit = idx('0123456789'); AL.dob = idx('0123456789/'); AL.upper = idx('ABCDEFGHIJKLMNOPQRSTUVWXYZ ');
     st('Sẵn sàng. Bật camera hoặc tải ảnh lên.');
     $('bStart').disabled = false;
   } catch (e) {
@@ -185,9 +185,9 @@ async function fixOrientation(card) {
   return score(b) > score(a) ? [r, b] : [card, a];
 }
 
-// ---------- 4. OCR từng vùng bằng Tesseract.js ----------
+// ---------- 4. OCR từng vùng bằng PaddleOCR (ONNX) ----------
 // Cách đọc: nới rộng khung YOLO (khung thường cắt sát, mất chữ ở hai đầu) -> phóng to -> kéo giãn tương phản
-// -> đọc 2 phiên bản (xám và đen trắng) -> chọn kết quả hợp lệ nhất (đủ 12 số, ngày hợp lệ, số khớp ngày sinh).
+// -> đọc 2 phiên bản (xám và màu gốc), số/ngày sinh chỉ cho phép chữ số -> chọn kết quả hợp lệ nhất (đủ 12 số, ngày hợp lệ, số khớp ngày sinh).
 const SNAP_NAMES = true;   // true: sửa họ tên theo từ điển họ/đệm/tên phổ biến (đặt false để tắt)
 const SURNAMES = new Set(`NGUYỄN TRẦN LÊ PHẠM HOÀNG HUỲNH PHAN VŨ VÕ ĐẶNG BÙI ĐỖ HỒ NGÔ DƯƠNG LÝ ĐINH TRƯƠNG LƯƠNG MAI LÂM ĐOÀN TRỊNH CAO TẠ HÀ VƯƠNG TÔ QUÁCH LẠI DIỆP TỪ ÂU LƯU LA ĐÀO ĐÀM KIỀU KHÚC LÃ PHÙNG THÁI TÀO`.split(/\s+/));
 const NAME_WORDS = new Set([...SURNAMES, ...`VĂN THỊ MINH QUỐC HỮU ĐỨC XUÂN ANH CÔNG THÀNH GIA NGỌC THANH THÙY PHƯƠNG HỒNG KIM BẢO DIỆU THU KHÁNH TRỌNG ĐÌNH QUANG TIẾN HOÀI TRUNG NHƯ YẾN TUẤN HẢI TRÍ VIỆT MỸ THẾ NHẬT PHÚC BÁ DUY TẤN TÚ HUYỀN THIÊN ĐĂNG NGUYÊN QUỲNH PHÚ SỸ
@@ -235,6 +235,7 @@ function prep(card, f, bin) {
   const g = c.getContext('2d', { willReadFrequently: true });
   g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.imageSmoothingQuality = 'high';
   g.drawImage(card, x, y, w, h, B, B, cw, ch);
+  if (bin === 3) return c;   // giữ nguyên màu
   const im = g.getImageData(0, 0, c.width, c.height), d = im.data, n = c.width * c.height, gray = new Uint8Array(n);
   for (let i = 0; i < n; i++) gray[i] = (0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]) | 0;
   const hist = new Uint32Array(256); for (let i = 0; i < n; i++) hist[gray[i]]++;
@@ -258,6 +259,29 @@ function prep(card, f, bin) {
   g.putImageData(im, 0, 0); return c;
 }
 
+function recTensor(c) {   // canvas -> tensor [1,3,48,W], BGR, chuẩn hóa -1..1 (đúng kiểu PaddleOCR)
+  const h = 48, w = Math.min(640, Math.max(16, Math.ceil(48 * c.width / c.height)));
+  const t = document.createElement('canvas'); t.width = w; t.height = h;
+  const g = t.getContext('2d', { willReadFrequently: true }); g.imageSmoothingQuality = 'high'; g.drawImage(c, 0, 0, w, h);
+  const d = g.getImageData(0, 0, w, h).data, n = w * h, f = new Float32Array(3 * n);
+  for (let i = 0; i < n; i++) { f[i] = (d[4 * i + 2] / 255 - .5) / .5; f[n + i] = (d[4 * i + 1] / 255 - .5) / .5; f[2 * n + i] = (d[4 * i] / 255 - .5) / .5; }
+  return new ort.Tensor('float32', f, [1, 3, h, w]);
+}
+function ctcDecode(data, T, C, allow) {   // allow: danh sách lớp được phép (gồm blank=0); null = tất cả
+  let s = '', last = -1, sum = 0, k = 0;
+  for (let t = 0; t < T; t++) {
+    const b = t * C; let bi = 0, bv = -1;
+    if (allow) { for (const i of allow) if (data[b + i] > bv) { bv = data[b + i]; bi = i; } }
+    else for (let i = 0; i < C; i++) if (data[b + i] > bv) { bv = data[b + i]; bi = i; }
+    if (bi !== 0 && bi !== last) { s += chars[bi]; sum += bv; k++; }
+    last = bi;
+  }
+  return { text: s, conf: k ? sum / k : 0 };
+}
+async function recognize(canvas, allow) {
+  const o = (await recS.run({ [recS.inputNames[0]]: recTensor(canvas) }))[recS.outputNames[0]];
+  return ctcDecode(o.data, o.dims[1], o.dims[2], allow);
+}
 const validDob = s => {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s); if (!m) return false;
   const dd = +m[1], mo = +m[2], y = +m[3], dt = new Date(y, mo - 1, dd);
@@ -275,6 +299,14 @@ function voteId(list) {   // bỏ phiếu từng vị trí giữa các kết qu�
   const L = list.filter(x => x.length === 12); if (L.length < 2) return null;
   return [...Array(12).keys()].map(i => { const c = {}; L.forEach(x => c[x[i]] = (c[x[i]] || 0) + 1); return Object.entries(c).sort((a, b) => b[1] - a[1])[0][0]; }).join('');
 }
+function segment(t) {   // tên bị dính liền (PHAMXUANHIEU) -> tách bằng từ điển
+  const b = noAccent(t), n = b.length, best = Array(n + 1).fill(null); best[0] = { s: 0, p: [] };
+  for (let i = 0; i < n; i++) if (best[i]) for (let j = i + 2; j <= Math.min(n, i + 8); j++) {
+    const w = b.slice(i, j); if (!NOACC.has(w)) continue;
+    const sc = best[i].s + (j - i) ** 2; if (!best[j] || sc > best[j].s) best[j] = { s: sc, p: [...best[i].p, w] };
+  }
+  return best[n] ? best[n].p.join(' ') : t;
+}
 const idCands = t => { const d = t.replace(/\D/g, ''); if (d.length <= 12) return [d]; const o = []; for (let i = 0; i + 12 <= d.length; i++) o.push(d.slice(i, i + 12)); return o; };
 const parseDob = t => { const m = t.match(/(\d{2})\s*[\/\-.]\s*(\d{2})\s*[\/\-.]\s*(\d{4})/); if (m) return m.slice(1).join('/'); const d = t.replace(/\D/g, ''); return d.length >= 8 ? `${d.slice(0, 2)}/${d.slice(2, 4)}/${d.slice(4, 8)}` : t.trim(); };
 const cleanName = t => t.normalize('NFC').replace(/[^A-Za-zÀ-ỹĐđ\s]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
@@ -288,6 +320,7 @@ function choose(c) {      // chọn tổ hợp (số, ngày sinh) hợp lệ và
   }
   let name = '', bs = -1e9;
   for (const n of c.name) { const s = nameScore(n); if (s > bs) { bs = s; name = n; } }
+  if (SNAP_NAMES) name = name.split(' ').map(w => w.length > 6 ? segment(w) : w).join(' ');   // tách các từ bị dính liền
   if (SNAP_NAMES) name = name.split(' ').map((w, i) => snapToken(w, i)).join(' ');
   return { id: best.id, dob: best.dob, name };
 }
@@ -304,16 +337,12 @@ async function readCard(frame, q) {
       const f = boxes[k]; if (!f) continue;
       g.strokeStyle = col[k]; g.strokeRect(f.x, f.y, f.w, f.h);
       st('Đang đọc: ' + k + '...');
-      for (const bin of [0, 1, 2]) {
+      for (const bin of [0, 3]) {
         const c = prep(card, f, bin);
         if (k === 'name') {
-          await wVie.setParameters({ tessedit_char_whitelist: '' }); cand.name.push(cleanName((await wVie.recognize(c)).data.text));
-          await wDigit.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ ' }); cand.name.push(cleanName((await wDigit.recognize(c)).data.text));
-        } else {
-          await wDigit.setParameters({ tessedit_char_whitelist: '0123456789' });
-          const t = (await wDigit.recognize(c)).data.text;
-          if (k === 'id') cand.id.push(...idCands(t)); else cand.dob.push(parseDob(t));
-        }
+          cand.name.push(cleanName((await recognize(c, null)).text), cleanName((await recognize(c, AL.upper)).text));
+        } else if (k === 'id') cand.id.push(...idCands((await recognize(c, AL.digit)).text));
+        else cand.dob.push(parseDob((await recognize(c, AL.dob)).text));
       }
     }
     const val = choose(cand);
