@@ -61,11 +61,11 @@ const CARD_MODEL = 'models/card_best.onnx', CARD_SZ = 640;
 const FIELD_MODEL = 'models/field_best.onnx', FIELD_SZ = 960;
 const REC_MODEL = 'models/rec.onnx', REC_DICT = 'models/rec_dict.txt';   // PaddleOCR PP-OCRv3 rec (ONNX) + bảng ký tự
 const FIELDS = ['id', 'name', 'dob'];          // thứ tự class của field_best.pt
-const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 6;
+const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 4;
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, recS, chars = [], AL = {}, armed = true, noCard = 0, tries = 0, lastOk = false,  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
+let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, stable = 0, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
 
 ort.env.wasm.numThreads = 1;                   // không cần cross-origin isolation (chạy được trên GitHub Pages)
@@ -101,7 +101,54 @@ function letterbox(src, sw, sh, S) {
   return { t: new ort.Tensor('float32', f, [1, 3, S, S]), r, dx, dy };
 }
 
-// ---------- 1. tìm thẻ bằng YOLO-seg: lấy mặt nạ rồi tìm 4 góc ----------
+// ---------- 1. tìm thẻ bằng YOLO-seg ----------
+// Mặt nạ của mô hình đôi khi lan sang tay/nền, nên không lấy 4 điểm cực của mặt nạ nữa.
+// Thay vào đó khớp một hình chữ nhật xoay có tỷ lệ cạnh của thẻ (~1.586) vào các điểm mà mô hình rất chắc là "thẻ".
+const MASK_TAU = 3;     // chỉ tính điểm mặt nạ có logit > 3 là chắc chắn thuộc thẻ
+function rectSearcher(v, N) {   // tìm hình chữ nhật xoay có tổng điểm lớn nhất; dùng ảnh tích phân cho mỗi góc xoay
+  const h2 = N / 2, R = new Float32Array(N * N), I = new Float32Array((N + 1) * (N + 1));
+  const me = { best: { s: -1e9 } };
+  function rotInt(th) {
+    const c = Math.cos(th), sn = Math.sin(th);
+    for (let y = 0; y < N; y++) {
+      const ty = y - h2, bx = sn * ty + h2, by = c * ty + h2;
+      for (let x = 0; x < N; x++) {
+        const tx = x - h2, xs = Math.round(c * tx + bx), ys = Math.round(-sn * tx + by);
+        R[y * N + x] = xs >= 0 && xs < N && ys >= 0 && ys < N ? v[ys * N + xs] : -1;
+      }
+    }
+    for (let y = 0; y < N; y++) { let row = 0; for (let x = 0; x < N; x++) { row += R[y * N + x]; I[(y + 1) * (N + 1) + x + 1] = I[y * (N + 1) + x + 1] + row; } }
+  }
+  me.search = (th, aspects, ws, step, win, rad) => {
+    rotInt(th);
+    for (const a of aspects) for (const w of ws) {
+      const wi = Math.round(w), hi = Math.round(w / a); if (wi < 6 || hi < 6 || wi >= N || hi >= N) continue;
+      const xa = win ? Math.max(0, win.x - rad) : 0, xb = win ? Math.min(N - wi, win.x + rad) : N - wi;
+      const ya = win ? Math.max(0, win.y - rad) : 0, yb = win ? Math.min(N - hi, win.y + rad) : N - hi;
+      for (let y = ya; y <= yb; y += step) for (let x = xa; x <= xb; x += step) {
+        const sc = I[(y + hi) * (N + 1) + x + wi] - I[y * (N + 1) + x + wi] - I[(y + hi) * (N + 1) + x] + I[y * (N + 1) + x];
+        if (sc > me.best.s) me.best = { s: sc, th, x, y, wi, hi };
+      }
+    }
+  };
+  return me;
+}
+function rectFit(v, N, wmax) {
+  const N2 = N >> 1, v2 = new Float32Array(N2 * N2);    // bản nửa độ phân giải để tìm thô cho nhanh
+  for (let y = 0; y < N2; y++) for (let x = 0; x < N2; x++)
+    v2[y * N2 + x] = (v[2 * y * N + 2 * x] + v[2 * y * N + 2 * x + 1] + v[(2 * y + 1) * N + 2 * x] + v[(2 * y + 1) * N + 2 * x + 1]) / 4;
+  const S2 = rectSearcher(v2, N2), ws = [];
+  for (let w = Math.max(12, wmax * 0.175); w < wmax / 2; w += Math.max(1, wmax * 0.02)) ws.push(w);
+  for (let d = -90; d < 90; d += 6) S2.search(d * Math.PI / 180, [1.5, 1.586, 1.7], ws, 2, null, 0);
+  const c0 = S2.best; if (c0.s < 0) return null;
+  const S = rectSearcher(v, N), th0 = c0.th * 180 / Math.PI, ws2 = [];
+  for (let w = c0.wi * 2 - 8; w <= c0.wi * 2 + 8; w += 2) ws2.push(w);
+  for (let d = th0 - 6; d <= th0 + 6.01; d += 1.5) S.search(d * Math.PI / 180, [1.5, 1.55, 1.586, 1.65, 1.7], ws2, 1, { x: c0.x * 2, y: c0.y * 2 }, 5);
+  const best = S.best, h2 = N / 2, c = Math.cos(best.th), sn = Math.sin(best.th);
+  const pts = [[best.x, best.y], [best.x + best.wi, best.y], [best.x + best.wi, best.y + best.hi], [best.x, best.y + best.hi]]
+    .map(([px, py]) => [c * (px - h2) - sn * (py - h2) + h2, sn * (px - h2) + c * (py - h2) + h2]);
+  return { pts, fill: best.s / (best.wi * best.hi) };
+}
 async function detectCard(src, sw, sh) {
   const L = letterbox(src, sw, sh, CARD_SZ);
   const res = await cardS.run({ [cardS.inputNames[0]]: L.t });
@@ -112,23 +159,16 @@ async function detectCard(src, sw, sh) {
   if (bi < 0) return null;
   const cx = d[bi], cy = d[N + bi], w = d[2 * N + bi], h = d[3 * N + bi];
   const co = new Float32Array(nm); for (let k = 0; k < nm; k++) co[k] = d[(5 + k) * N + bi];
-  const sc = pw / CARD_SZ, pd = p.data;
-  const x1 = Math.max(0, Math.floor((cx - w / 2) * sc)), x2 = Math.min(pw - 1, Math.ceil((cx + w / 2) * sc));
-  const y1 = Math.max(0, Math.floor((cy - h / 2) * sc)), y2 = Math.min(ph - 1, Math.ceil((cy + h / 2) * sc));
-  let tl, tr, br, bl, mTL = 1e9, mBR = -1e9, mTR = -1e9, mBL = 1e9;
+  const f = pw / CARD_SZ, pd = p.data, np_ = ph * pw, v = new Float32Array(np_).fill(-1);
+  const x1 = Math.max(0, Math.floor((cx - w * 0.54) * f)), x2 = Math.min(pw - 1, Math.ceil((cx + w * 0.54) * f));
+  const y1 = Math.max(0, Math.floor((cy - h * 0.54) * f)), y2 = Math.min(ph - 1, Math.ceil((cy + h * 0.54) * f));
   for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
-    let s = 0; for (let k = 0; k < nm; k++) s += co[k] * pd[k * ph * pw + y * pw + x];
-    if (s <= 0) continue;
-    const a = x + y, b = x - y;
-    if (a < mTL) { mTL = a; tl = [x, y]; } if (a > mBR) { mBR = a; br = [x, y]; }
-    if (b > mTR) { mTR = b; tr = [x, y]; } if (b < mBL) { mBL = b; bl = [x, y]; }
+    let s = 0; for (let k = 0; k < nm; k++) s += co[k] * pd[k * np_ + y * pw + x];
+    v[y * pw + x] = Math.max(-1, Math.min(1, (s - MASK_TAU) / 3));
   }
-  if (!tl) return null;
-  const toSrc = ([x, y]) => [((x + 0.5) / sc - L.dx) / L.r, ((y + 0.5) / sc - L.dy) / L.r];
-  let q = [tl, tr, br, bl].map(toSrc);
-  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
-  if (dist(q[0], q[3]) > dist(q[0], q[1])) q = [q[1], q[2], q[3], q[0]];   // thẻ dọc -> xoay thứ tự góc
-  return q;
+  const r = rectFit(v, pw, Math.max(w, h) * f * 1.1);
+  if (!r || r.fill < 0.3) return null;               // mặt nạ quá rời rạc -> coi như chưa thấy thẻ
+  return r.pts.map(([x, y]) => [(x / f - L.dx) / L.r, (y / f - L.dy) / L.r]);
 }
 
 // ---------- 2. nắn phẳng (perspective transform tự viết, không cần OpenCV) ----------
@@ -380,28 +420,38 @@ async function loop() {
   if (!busy && v.readyState >= 2) {
     busy = true;
     try {
-      quad = await detectCard(v, v.videoWidth, v.videoHeight);
+      let raw = await detectCard(v, v.videoWidth, v.videoHeight);
       const diag = Math.hypot(v.videoWidth, v.videoHeight);
-      stable = quad && prev ? (quad.reduce((s, p, i) => s + Math.hypot(p[0] - prev[i][0], p[1] - prev[i][1]), 0) / 4 / diag < 0.01 ? stable + 1 : 0) : 0;
-      prev = quad;
+      if (raw) {
+        miss = 0;
+        if (prev) {
+          const mv = raw.reduce((t, p, i) => t + Math.hypot(p[0] - prev[i][0], p[1] - prev[i][1]), 0) / 4 / diag;
+          stable = mv < 0.015 ? stable + 1 : 0;
+          if (mv < 0.05) raw = raw.map((p, i) => [prev[i][0] * .5 + p[0] * .5, prev[i][1] * .5 + p[1] * .5]);   // làm mượt, bớt rung
+        } else stable = 0;
+      } else if (prev && ++miss <= 2) raw = prev;      // rớt 1-2 khung thì giữ khung cũ, tránh nhấp nháy
+      else stable = 0;
+      quad = prev = raw;
     } catch (e) { quad = null; }
     busy = false;
     ov.width = v.videoWidth; ov.height = v.videoHeight;
     const g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height);
     if (quad) {
-      noCard = 0;
-      const ok = stable >= STABLE_NEED;
+      lastSeen = Date.now();
+      const big = Math.hypot(quad[1][0] - quad[0][0], quad[1][1] - quad[0][1]) >= 0.28 * v.videoWidth;   // thẻ đủ lớn mới tự đọc
+      const ok = stable >= STABLE_NEED && big;
       g.strokeStyle = ok ? '#2ee59d' : '#ffc43d'; g.lineWidth = Math.max(3, ov.width / 300);
       g.beginPath(); quad.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); g.stroke();
+      const rd = Math.max(5, ov.width / 180); g.fillStyle = g.strokeStyle; quad.forEach(([x, y]) => { g.beginPath(); g.arc(x, y, rd, 0, 7); g.fill(); });   // chấm 4 góc
       if (!armed && $('auto').checked) st(lastOk ? 'Đã đọc xong. Bỏ thẻ ra khỏi khung để đọc thẻ khác.' : $('st').textContent);
-      else st(ok ? ($('auto').checked ? 'Thẻ đã ổn định, đang tự đọc...' : 'Thẻ đã ổn định, sẵn sàng đọc.') : 'Giữ thẻ đứng yên...');
+      else st(!big ? 'Đưa thẻ lại gần hơn.' : ok ? ($('auto').checked ? 'Thẻ đã ổn định, đang tự đọc...' : 'Thẻ đã ổn định, sẵn sàng đọc.') : 'Giữ thẻ đứng yên...');
       if (ok && armed && $('auto').checked && Date.now() - lastAuto > 2500) { lastAuto = Date.now(); stable = 0; grab(); readCard(fc, quad, true); }
     } else {
-      if (++noCard >= 8) { armed = true; tries = 0; }   // thẻ rời khung ~1 giây -> sẵn sàng đọc thẻ mới
+      if (Date.now() - lastSeen > 1000) { armed = true; tries = 0; }   // thẻ rời khung hơn 1 giây -> sẵn sàng đọc thẻ mới
       st('Đưa CCCD vào khung hình.');
     }
   }
-  setTimeout(loop, 120);
+  setTimeout(loop, 30);
 }
 
 async function toggleCam() {
