@@ -1,0 +1,41 @@
+# Môi trường ảo và cache
+venv/
+.venv/
+.cache/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Trọng số EasyOCR: tự tải lại khi chạy app (craft ~81 MB, latin_g2 ~15 MB)
+# (không ignore cả thư mục models/ để còn đẩy được file .onnx cho index.html)
+models/*.pth
+models/*.pt
+models/user_network/
+
+# Dữ liệu huấn luyện, file nén (nặng, và có thể chứa dữ liệu cá nhân)
+file_huan_luyen/
+dataset/
+dataset_yolo/
+dataset_flat/
+card_seg/
+*.zip
+*.rar
+
+# Ảnh chân dung dùng để sinh dữ liệu: ảnh người thật, không nên công khai
+faces/*
+!faces/.gitkeep
+
+# Thư mục thử nghiệm, video demo nặng
+Nháp/
+VIDEO_demo_HL/
+chuyển cả dataset sang OBB/
+siết một hộp cho ôm sát chữ/
+
+# Model cũ
+best.pt
+
+# Hệ điều hành / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
