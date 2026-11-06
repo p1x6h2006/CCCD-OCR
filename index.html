@@ -186,15 +186,95 @@ async function fixOrientation(card) {
 }
 
 // ---------- 4. OCR từng vùng bằng Tesseract.js ----------
-function crop(card, f) {
-  const px = 6, py = 4, x = Math.max(0, f.x - px), y = Math.max(0, f.y - py);
-  const w = Math.min(CW - x, f.w + 2 * px), h = Math.min(CH - y, f.h + 2 * py), k = Math.max(1, 80 / h);
-  const c = document.createElement('canvas'); c.width = Math.round(w * k); c.height = Math.round(h * k);
-  c.getContext('2d').drawImage(card, x, y, w, h, 0, 0, c.width, c.height); return c;
+// Cách đọc: nới rộng khung YOLO (khung thường cắt sát, mất chữ ở hai đầu) -> phóng to -> kéo giãn tương phản
+// -> đọc 2 phiên bản (xám và đen trắng) -> chọn kết quả hợp lệ nhất (đủ 12 số, ngày hợp lệ, số khớp ngày sinh).
+const SNAP_NAMES = true;   // true: sửa họ tên theo từ điển họ/đệm/tên phổ biến (đặt false để tắt)
+const SURNAMES = new Set(`NGUYỄN TRẦN LÊ PHẠM HOÀNG HUỲNH PHAN VŨ VÕ ĐẶNG BÙI ĐỖ HỒ NGÔ DƯƠNG LÝ ĐINH TRƯƠNG LƯƠNG MAI LÂM ĐOÀN TRỊNH CAO TẠ HÀ VƯƠNG TÔ QUÁCH LẠI DIỆP TỪ ÂU LƯU LA ĐÀO ĐÀM KIỀU KHÚC LÃ PHÙNG THÁI TÀO`.split(/\s+/));
+const NAME_WORDS = new Set([...SURNAMES, ...`VĂN THỊ MINH QUỐC HỮU ĐỨC XUÂN ANH CÔNG THÀNH GIA NGỌC THANH THÙY PHƯƠNG HỒNG KIM BẢO DIỆU THU KHÁNH TRỌNG ĐÌNH QUANG TIẾN HOÀI TRUNG NHƯ YẾN TUẤN HẢI TRÍ VIỆT MỸ THẾ NHẬT PHÚC BÁ DUY TẤN TÚ HUYỀN THIÊN ĐĂNG NGUYÊN QUỲNH PHÚ SỸ
+AN BÌNH CƯỜNG DŨNG HIẾU HÙNG NAM SƠN KHOA LONG ĐẠT HUY THẮNG LAN LINH THẢO TRANG VY NGÂN HƯƠNG NHI CHI OANH TRÂM QUYÊN UYÊN LOAN HẠNH HOA HUỆ NGHĨA TÍN LỘC TÀI TÂM TOÀN TRỰC VINH PHONG PHƯỚC THỊNH THUẬN THIỆN KIỆT KHÔI HẬU GIANG DUNG DUYÊN ĐAN ĐIỀN ĐÔNG NHÂN NHÃ NHUNG LIÊN LỆ KHANG HƯNG HOÀN HÂN HẰNG HÒA HIỀN HIỆP LUÂN LỢI MẠNH NGHIÊM NGUYỆT PHÁT PHI QUÂN QUYỀN SANG SƯƠNG TÂN TRIỀU TÙNG TƯỜNG VÂN VĨ ÂN`.split(/\s+/)]);
+
+function lev(a, b) {
+  const m = a.length, n = b.length, d = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 1; j <= n; j++) d[0][j] = j;
+  for (let i = 1; i <= m; i++) for (let j = 1; j <= n; j++)
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return d[m][n];
 }
-const parseId = t => { const d = t.replace(/\D/g, ''); return (d.match(/\d{12}/) || [d])[0]; };
+const noAccent = x => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/Đ/g, 'D');
+function snapToken(t, pos = 1) {   // 1) khớp khi bỏ dấu (OCR hay làm rơi dấu)  2) sai đúng 1 ký tự và chỉ có 1 ứng viên
+  if (NAME_WORDS.has(t) || t.length < 3) return t;
+  const base = noAccent(t); let same = [...NAME_WORDS].filter(w => w.length >= 3 && noAccent(w) === base);
+  if (same.length > 1) {   // mơ hồ (vd NGUYEN = NGUYỄN hoặc NGUYÊN): từ đầu tiên ưu tiên là họ, các từ sau ưu tiên không phải họ
+    const pick = same.filter(w => pos === 0 ? SURNAMES.has(w) : !SURNAMES.has(w));
+    if (pick.length) same = pick;
+  }
+  if (same.length) return same.length === 1 ? same[0] : t;
+  let best = null, cnt = 0;
+  for (const w of NAME_WORDS) if (w.length >= 3 && Math.abs(w.length - t.length) <= 1 && lev(t, w) === 1) { best = w; cnt++; }
+  return cnt === 1 ? best : t;
+}
+function otsu(g) {
+  const h = new Array(256).fill(0); for (const v of g) h[v]++;
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * h[i];
+  let sB = 0, wB = 0, mx = 0, t = 127; const tot = g.length;
+  for (let i = 0; i < 256; i++) {
+    wB += h[i]; if (!wB) continue; const wF = tot - wB; if (!wF) break;
+    sB += i * h[i]; const mB = sB / wB, mF = (sum - sB) / wF, vr = wB * wF * (mB - mF) ** 2;
+    if (vr > mx) { mx = vr; t = i; }
+  }
+  return t;
+}
+function padBox(f) {      // nới khung: 12% chiều rộng + 8px hai bên, 25% chiều cao + 4px trên dưới
+  const px = f.w * 0.12 + 8, py = f.h * 0.25 + 4, x = Math.max(0, f.x - px), y = Math.max(0, f.y - py);
+  return { x, y, w: Math.min(CW - x, f.w + 2 * px), h: Math.min(CH - y, f.h + 2 * py) };
+}
+function prep(card, f, bin) {
+  const p = padBox(f), x = Math.floor(p.x), y = Math.floor(p.y), w = Math.ceil(p.w), h = Math.ceil(p.h);
+  const k = Math.min(4, Math.max(1.5, 110 / h)), B = 14, cw = Math.round(w * k), ch = Math.round(h * k);
+  const c = document.createElement('canvas'); c.width = cw + 2 * B; c.height = ch + 2 * B;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.imageSmoothingQuality = 'high';
+  g.drawImage(card, x, y, w, h, B, B, cw, ch);
+  const im = g.getImageData(0, 0, c.width, c.height), d = im.data, n = c.width * c.height, gray = new Uint8Array(n);
+  for (let i = 0; i < n; i++) gray[i] = (0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]) | 0;
+  const hist = new Uint32Array(256); for (let i = 0; i < n; i++) hist[gray[i]]++;
+  let lo = 0, hi = 255, acc = 0;
+  while (lo < 255 && (acc += hist[lo]) < n * 0.02) lo++;
+  acc = 0; while (hi > 0 && (acc += hist[hi]) < n * 0.02) hi--;
+  const span = Math.max(1, hi - lo);
+  for (let i = 0; i < n; i++) gray[i] = Math.max(0, Math.min(255, ((gray[i] - lo) * 255 / span) | 0));
+  const t = bin ? otsu(gray) : -1;
+  for (let i = 0; i < n; i++) { const vv = bin ? (gray[i] > t ? 255 : 0) : gray[i]; d[4 * i] = d[4 * i + 1] = d[4 * i + 2] = vv; d[4 * i + 3] = 255; }
+  g.putImageData(im, 0, 0); return c;
+}
+
+const validDob = s => {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s); if (!m) return false;
+  const dd = +m[1], mo = +m[2], y = +m[3], dt = new Date(y, mo - 1, dd);
+  return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === dd && y >= 1900 && y <= new Date().getFullYear();
+};
+// Cấu trúc CCCD: 3 số mã tỉnh (001-096), 1 số giới tính/thế kỷ (0-3), 2 số cuối năm sinh, 6 số ngẫu nhiên
+const consistent = (id, dob) => id.length === 12 && validDob(dob) && id.slice(4, 6) === dob.slice(-2) && ((+dob.slice(-4) >= 2000) ? '23' : '01').includes(id[3]);
+const idScore = s => (s.length === 12 ? 100 : 50 - 12 * Math.abs(s.length - 12))
+  + (s.length >= 3 && +s.slice(0, 3) >= 1 && +s.slice(0, 3) <= 96 ? 10 : 0) + (s.length >= 4 && '0123'.includes(s[3]) ? 5 : 0);
+const dobScore = s => validDob(s) ? 60 : (/^\d{2}\/\d{2}\/\d{4}$/.test(s) ? 20 : 0);
+const nameScore = n => { const t = n.split(' ').filter(Boolean); return t.reduce((s, w) => s + (NAME_WORDS.has(w) ? 3 : w.length >= 2 ? 1 : -2), 0) - (t.length < 2 || t.length > 6 ? 3 : 0); };
+
+const idCands = t => { const d = t.replace(/\D/g, ''); if (d.length <= 12) return [d]; const o = []; for (let i = 0; i + 12 <= d.length; i++) o.push(d.slice(i, i + 12)); return o; };
 const parseDob = t => { const m = t.match(/(\d{2})\s*[\/\-.]\s*(\d{2})\s*[\/\-.]\s*(\d{4})/); if (m) return m.slice(1).join('/'); const d = t.replace(/\D/g, ''); return d.length >= 8 ? `${d.slice(0, 2)}/${d.slice(2, 4)}/${d.slice(4, 8)}` : t.trim(); };
-const cleanName = t => t.replace(/[^A-Za-zÀ-ỹĐđ\s]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+const cleanName = t => t.normalize('NFC').replace(/[^A-Za-zÀ-ỹĐđ\s]/g, ' ').replace(/\s+/g, ' ').trim().toUpperCase();
+
+function choose(c) {      // chọn tổ hợp (số, ngày sinh) hợp lệ và khớp nhau nhất; chọn họ tên có nhiều từ đúng nhất
+  let best = { id: '', dob: '', s: -1e9 };
+  for (const i of (c.id.length ? c.id : [''])) for (const d of (c.dob.length ? c.dob : [''])) {
+    const s = idScore(i) + dobScore(d) + (consistent(i, d) ? 60 : 0);
+    if (s > best.s) best = { id: i, dob: d, s };
+  }
+  let name = '', bs = -1e9;
+  for (const n of c.name) { const s = nameScore(n); if (s > bs) { bs = s; name = n; } }
+  if (SNAP_NAMES) name = name.split(' ').map((w, i) => snapToken(w, i)).join(' ');
+  return { id: best.id, dob: best.dob, name };
+}
 
 async function readCard(frame, q) {
   busy = true; $('bRead').disabled = true;
@@ -203,21 +283,31 @@ async function readCard(frame, q) {
     const [card, boxes] = await fixOrientation(warp(frame, q));
     const out = $('out'); out.width = CW; out.height = CH; out.style.display = 'block';
     const g = out.getContext('2d'); g.drawImage(card, 0, 0); g.lineWidth = 3;
-    const col = { id: '#e53935', name: '#2e7d32', dob: '#1e63d6' }, val = { id: '', name: '', dob: '' };
+    const col = { id: '#e53935', name: '#2e7d32', dob: '#1e63d6' }, cand = { id: [], name: [], dob: [] };
     for (const k of FIELDS) {
       const f = boxes[k]; if (!f) continue;
       g.strokeStyle = col[k]; g.strokeRect(f.x, f.y, f.w, f.h);
       st('Đang đọc: ' + k + '...');
-      const c = crop(card, f);
-      if (k === 'name') { await wVie.setParameters({ tessedit_char_whitelist: '' }); val.name = cleanName((await wVie.recognize(c)).data.text); }
-      else {
-        await wDigit.setParameters({ tessedit_char_whitelist: k === 'id' ? '0123456789' : '0123456789/-.' });
-        const t = (await wDigit.recognize(c)).data.text; val[k] = k === 'id' ? parseId(t) : parseDob(t);
+      for (const bin of [false, true]) {
+        const c = prep(card, f, bin);
+        if (k === 'name') { await wVie.setParameters({ tessedit_char_whitelist: '' }); cand.name.push(cleanName((await wVie.recognize(c)).data.text)); }
+        else {
+          await wDigit.setParameters({ tessedit_char_whitelist: k === 'id' ? '0123456789' : '0123456789/-.' });
+          const t = (await wDigit.recognize(c)).data.text;
+          if (k === 'id') cand.id.push(...idCands(t)); else cand.dob.push(parseDob(t));
+        }
       }
     }
+    const val = choose(cand);
     $('fn').value = val.name; $('fi').value = val.id; $('fd').value = val.dob;
+    const w = [];
+    if (val.id.length !== 12) w.push('số CCCD chưa đủ 12 chữ số');
+    if (!validDob(val.dob)) w.push('ngày sinh chưa hợp lệ');
+    if (val.id.length === 12 && validDob(val.dob) && !consistent(val.id, val.dob)) w.push('số CCCD không khớp ngày sinh');
+    $('fi').classList.toggle('bad', val.id.length !== 12); $('fd').classList.toggle('bad', !validDob(val.dob));
     const miss = FIELDS.filter(k => !boxes[k]);
-    st(miss.length ? 'Không thấy vùng: ' + miss.join(', ') + '. Hãy nhập tay hoặc chụp lại.' : 'Xong. Kiểm tra và sửa nếu cần.');
+    st(miss.length ? 'Không thấy vùng: ' + miss.join(', ') + '. Hãy nhập tay hoặc chụp lại.'
+      : w.length ? 'Đã đọc nhưng cần kiểm tra: ' + w.join('; ') + '.' : 'Xong. Kiểm tra và sửa nếu cần.');
   } catch (e) { st('Lỗi: ' + e.message); }
   busy = false; $('bRead').disabled = !live;
 }
@@ -266,9 +356,10 @@ $('up').onchange = async e => {
   readCard(fc, q);
 };
 $('bOk').onclick = () => {
-  const okId = /^\d{12}$/.test($('fi').value.trim());
-  $('fi').classList.toggle('bad', !okId);
-  $('msg').textContent = (okId ? 'Đã ghi nhận: ' : 'Số CCCD cần đủ 12 chữ số. Đã ghi nhận: ') + [$('fn').value, $('fi').value, $('fd').value].join(' | ');
+  const okId = /^\d{12}$/.test($('fi').value.trim()), okDob = validDob($('fd').value.trim());
+  $('fi').classList.toggle('bad', !okId); $('fd').classList.toggle('bad', !okDob);
+  const w = [!okId && 'Số CCCD cần đủ 12 chữ số', !okDob && 'Ngày sinh cần đúng dạng dd/mm/yyyy'].filter(Boolean);
+  $('msg').textContent = (w.length ? w.join('. ') + '. Đã ghi nhận: ' : 'Đã ghi nhận: ') + [$('fn').value, $('fi').value, $('fd').value].join(' | ');
 };
 init();
 </script>
