@@ -27,6 +27,20 @@ label{display:block;margin-top:10px;font-size:.85rem;color:var(--mu)}
 input[type=text]{width:100%;padding:9px;border:1px solid var(--ln);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
 #out{width:100%;border-radius:6px;margin-bottom:6px;display:none}
 .bad{border-color:#d33!important}
+.list{grid-column:1/-1}
+.list h2{margin:0 0 10px;font-size:1.1rem}
+.list h2 span{color:var(--mu);font-weight:400}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.95rem}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--ln);white-space:nowrap}
+th{color:var(--mu);font-weight:500;font-size:.85rem}
+td button{padding:4px 10px;font-size:.85rem}
+#empty{color:var(--mu);margin:8px 0 0}
+td button.thumb{padding:0;border:1px solid var(--ln);background:none;border-radius:4px;line-height:0;cursor:zoom-in}
+.thumb img{height:52px;width:auto;border-radius:3px;display:block}
+#zoom{position:fixed;inset:0;background:rgba(0,0,0,.78);display:flex;align-items:center;justify-content:center;padding:20px;z-index:10;cursor:zoom-out}
+#zoom[hidden]{display:none}
+#zoom img{width:min(100%,900px);height:auto;border-radius:8px}
 </style>
 </head>
 <body>
@@ -53,7 +67,17 @@ input[type=text]{width:100%;padding:9px;border:1px solid var(--ln);border-radius
   <div class="row"><button id="bOk">Đăng ký</button></div>
   <p id="msg"></p>
 </section>
+
+<section class="list">
+  <h2>Danh sách đã đăng ký <span id="cnt">(0)</span></h2>
+  <div class="tw"><table>
+    <thead><tr><th>#</th><th>Ảnh thẻ</th><th>Họ và tên</th><th>Số CCCD</th><th>Ngày sinh</th><th>Đăng ký lúc</th><th></th></tr></thead>
+    <tbody id="tb"></tbody>
+  </table></div>
+  <p id="empty">Chưa có ai đăng ký.</p>
+</section>
 </main>
+<div id="zoom" hidden><img id="zimg" alt="Ảnh thẻ đã quét"></div>
 
 <script>
 // Đường dẫn model: xuất bằng `yolo export ... format=onnx`, đặt trong thư mục models/ cạnh file này
@@ -65,7 +89,7 @@ const CW = 856, CH = 540, CARD_CONF = 0.7, MIN_FILL = 0.6, SHOW_NEED = 2, STRONG
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, pr = null, big = false, bfReady = false, bestQ = null, bestScore = 0, bestT = 0, lastSharp = 0, stable = 0, seen = 0, locked = false, busy = false, live = false, lastAuto = 0;
+let lastCard = null, cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, pr = null, big = false, bfReady = false, bestQ = null, bestScore = 0, bestT = 0, lastSharp = 0, stable = 0, seen = 0, locked = false, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
 const bf = document.createElement('canvas');   // khung nét nhất trong khoảng ngay trước khi đọc
 
@@ -405,7 +429,7 @@ async function readCard(frame, q, auto) {
   busy = true; $('bRead').disabled = true;
   try {
     st('Đang nắn phẳng thẻ...');
-    const [card, boxes] = await fixOrientation(warp(frame, q));
+    const [card, boxes] = await fixOrientation(warp(frame, q)); lastCard = card;
     const out = $('out'); out.width = CW; out.height = CH; out.style.display = 'block';
     const g = out.getContext('2d'); g.drawImage(card, 0, 0); g.lineWidth = 3;
     const col = { id: '#e53935', name: '#2e7d32', dob: '#1e63d6' }, cand = { id: [], name: [], dob: [] };
@@ -438,7 +462,7 @@ async function readCard(frame, q, auto) {
     if (val.id.length === 12 && validDob(val.dob) && !consistent(val.id, val.dob)) w.push('số CCCD không khớp ngày sinh');
     $('fi').classList.toggle('bad', val.id.length !== 12); $('fd').classList.toggle('bad', !validDob(val.dob));
     const miss = FIELDS.filter(k => !boxes[k]);
-    if (miss.length === FIELDS.length) { out.style.display = 'none'; lastOk = false; if (auto) armed = false; st('Vật trong khung không phải CCCD (không thấy số, tên, ngày sinh).'); busy = false; $('bRead').disabled = !live; return; }
+    if (miss.length === FIELDS.length) { lastCard = null; out.style.display = 'none'; lastOk = false; if (auto) armed = false; st('Vật trong khung không phải CCCD (không thấy số, tên, ngày sinh).'); busy = false; $('bRead').disabled = !live; return; }
     st(miss.length ? 'Không thấy vùng: ' + miss.join(', ') + '. Hãy nhập tay hoặc chụp lại.'
       : w.length ? 'Đã đọc nhưng cần kiểm tra: ' + w.join('; ') + '.' : 'Xong. Kiểm tra và sửa nếu cần.');
     lastOk = !miss.length && !w.length;
@@ -527,12 +551,63 @@ $('up').onchange = async e => {
   if (!q) return st('Không thấy thẻ trong ảnh.');
   readCard(fc, q);
 };
+// ---------- danh sách đăng ký (lưu trong localStorage của trình duyệt, tải lại trang vẫn còn) ----------
+let reg = []; try { reg = JSON.parse(localStorage.getItem('cccd_reg') || '[]'); } catch (e) {}
+function saveReg() {   // trả về số ảnh phải bỏ vì đầy bộ nhớ trình duyệt (-1: không lưu nổi)
+  let dropped = 0;
+  for (;;) {
+    try { localStorage.setItem('cccd_reg', JSON.stringify(reg)); return dropped; }
+    catch (e) { const i = reg.findIndex(r => r.img); if (i < 0) return -1; reg[i].img = ''; dropped++; }   // bỏ ảnh của mục cũ nhất trước
+  }
+}
+function snap(c) {   // thu nhỏ ảnh thẻ về 640px, nén JPEG để đỡ tốn bộ nhớ
+  const W = 640, H = Math.round(c.height * W / c.width), t = document.createElement('canvas'); t.width = W; t.height = H;
+  t.getContext('2d').drawImage(c, 0, 0, W, H); return t.toDataURL('image/jpeg', 0.8);
+}
+const zoom = (src) => { $('zimg').src = src; $('zoom').hidden = false; };
+$('zoom').onclick = () => { $('zoom').hidden = true; };
+addEventListener('keydown', e => { if (e.key === 'Escape') $('zoom').hidden = true; });
+function renderReg() {
+  const tb = $('tb'); tb.textContent = '';
+  reg.forEach((r, i) => {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = i + 1;
+    const ci = tr.insertCell();
+    if (r.img) {
+      const tb2 = document.createElement('button'); tb2.className = 'thumb'; tb2.title = 'Bấm để xem lớn'; tb2.setAttribute('aria-label', 'Xem ảnh thẻ của ' + r.name);
+      const im = document.createElement('img'); im.src = r.img; im.alt = ''; tb2.appendChild(im); tb2.onclick = () => zoom(r.img); ci.appendChild(tb2);
+    } else ci.textContent = '—';
+    [r.name, r.id, r.dob, r.t].forEach(x => { tr.insertCell().textContent = x; });
+    const b = document.createElement('button'); b.className = 'ghost'; b.textContent = 'Xóa';
+    b.onclick = () => { reg.splice(i, 1); saveReg(); renderReg(); };
+    tr.insertCell().appendChild(b);
+  });
+  $('cnt').textContent = '(' + reg.length + ')'; $('empty').style.display = reg.length ? 'none' : '';
+}
+function resetForm() {   // xóa thông tin phía trên để đón thẻ tiếp theo
+  ['fn', 'fi', 'fd'].forEach(k => { $(k).value = ''; $(k).classList.remove('bad'); });
+  $('out').style.display = 'none'; lastCard = null;
+}
 $('bOk').onclick = () => {
-  const okId = /^\d{12}$/.test($('fi').value.trim()), okDob = validDob($('fd').value.trim());
-  $('fi').classList.toggle('bad', !okId); $('fd').classList.toggle('bad', !okDob);
-  const w = [!okId && 'Số CCCD cần đủ 12 chữ số', !okDob && 'Ngày sinh cần đúng dạng dd/mm/yyyy'].filter(Boolean);
-  $('msg').textContent = (w.length ? w.join('. ') + '. Đã ghi nhận: ' : 'Đã ghi nhận: ') + [$('fn').value, $('fi').value, $('fd').value].join(' | ');
+  const name = $('fn').value.trim().replace(/\s+/g, ' '), id = $('fi').value.trim(), dob = $('fd').value.trim();
+  const okId = /^\d{12}$/.test(id), okDob = validDob(dob);
+  $('fn').classList.toggle('bad', !name); $('fi').classList.toggle('bad', !okId); $('fd').classList.toggle('bad', !okDob);
+  const w = [!name && 'Chưa có họ tên', !okId && 'Số CCCD cần đủ 12 chữ số', !okDob && 'Ngày sinh cần đúng dạng dd/mm/yyyy'].filter(Boolean);
+  if (w.length) { $('msg').textContent = w.join('. ') + '.'; return; }
+  const dup = reg.find(r => r.id === id);
+  if (dup) $('msg').textContent = 'Số CCCD ' + id + ' đã đăng ký trước đó (' + dup.name + '), không thêm lại.';
+  else {
+    reg.push({ name, id, dob, t: new Date().toLocaleString('vi-VN'), img: lastCard ? snap(lastCard) : '' });
+    const d = saveReg(); renderReg();
+    $('msg').textContent = 'Đã đăng ký: ' + name + ' | ' + id + ' | ' + dob
+      + (d > 0 ? '. Bộ nhớ trình duyệt đầy nên đã bỏ ảnh của ' + d + ' mục cũ nhất.' : d < 0 ? '. Không lưu được vào bộ nhớ trình duyệt, tải lại trang sẽ mất danh sách.' : '');
+  }
+  resetForm();
+  armed = false; tries = 0; lastOk = true;     // đợi thẻ này rời khung rồi mới đọc thẻ tiếp, tránh đọc lại chính nó
+  st('Bỏ thẻ ra khỏi khung, rồi đưa thẻ tiếp theo vào.');
 };
+renderReg();
+
 init();
 </script>
 </body>
