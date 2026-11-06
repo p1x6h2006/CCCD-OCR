@@ -61,11 +61,11 @@ const CARD_MODEL = 'models/card_best.onnx', CARD_SZ = 640;
 const FIELD_MODEL = 'models/field_best.onnx', FIELD_SZ = 960;
 const REC_MODEL = 'models/rec.onnx', REC_DICT = 'models/rec_dict.txt';   // PaddleOCR PP-OCRv3 rec (ONNX) + bảng ký tự
 const FIELDS = ['id', 'name', 'dob'];          // thứ tự class của field_best.pt
-const CW = 856, CH = 540, CARD_CONF = 0.5, FIELD_CONF = 0.25, STABLE_NEED = 2;      // chỉ cần thẻ không bị xê dịch mạnh trong 2 lần dò liên tiếp (cho phép tay run nhẹ)
+const CW = 856, CH = 540, CARD_CONF = 0.65, MIN_FILL = 0.55, SHOW_NEED = 3, FIELD_CONF = 0.25, STABLE_NEED = 2;      // chỉ cần thẻ không bị xê dịch mạnh trong 2 lần dò liên tiếp (cho phép tay run nhẹ)
 
 const $ = id => document.getElementById(id);
 const v = $('v'), ov = $('ov'), st = t => $('st').textContent = t;
-let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, pr = null, big = false, bfReady = false, bestQ = null, bestScore = 0, bestT = 0, lastSharp = 0, stable = 0, busy = false, live = false, lastAuto = 0;
+let cardS, fieldS, recS, chars = [], AL = {}, armed = true, miss = 0, lastSeen = 0, tries = 0, lastOk = false,  quad = null, prev = null, pr = null, big = false, bfReady = false, bestQ = null, bestScore = 0, bestT = 0, lastSharp = 0, stable = 0, seen = 0, busy = false, live = false, lastAuto = 0;
 const fc = document.createElement('canvas');   // khung hình đầy đủ để cắt/nắn
 const bf = document.createElement('canvas');   // khung nét nhất trong khoảng ngay trước khi đọc
 
@@ -154,7 +154,7 @@ function rectFit(v, N, wmax) {
   const best = S.best, h2 = N / 2, c = Math.cos(best.th), sn = Math.sin(best.th);
   const pts = [[best.x, best.y], [best.x + best.wi, best.y], [best.x + best.wi, best.y + best.hi], [best.x, best.y + best.hi]]
     .map(([px, py]) => [c * (px - h2) - sn * (py - h2) + h2, sn * (px - h2) + c * (py - h2) + h2]);
-  return { pts, fill: best.s / (best.wi * best.hi) };
+  return { pts, fill: best.s / (best.wi * best.hi), area: best.wi * best.hi };
 }
 async function detectCard(src, sw, sh) {
   const L = letterbox(src, sw, sh, CARD_SZ);
@@ -166,15 +166,17 @@ async function detectCard(src, sw, sh) {
   if (bi < 0) return null;
   const cx = d[bi], cy = d[N + bi], w = d[2 * N + bi], h = d[3 * N + bi];
   const co = new Float32Array(nm); for (let k = 0; k < nm; k++) co[k] = d[(5 + k) * N + bi];
-  const f = pw / CARD_SZ, pd = p.data, np_ = ph * pw, v = new Float32Array(np_).fill(-1);
+  const f = pw / CARD_SZ, pd = p.data, np_ = ph * pw, v = new Float32Array(np_).fill(-1); let pos = 0;
   const x1 = Math.max(0, Math.floor((cx - w * 0.54) * f)), x2 = Math.min(pw - 1, Math.ceil((cx + w * 0.54) * f));
   const y1 = Math.max(0, Math.floor((cy - h * 0.54) * f)), y2 = Math.min(ph - 1, Math.ceil((cy + h * 0.54) * f));
   for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
     let s = 0; for (let k = 0; k < nm; k++) s += co[k] * pd[k * np_ + y * pw + x];
-    v[y * pw + x] = Math.max(-1, Math.min(1, (s - MASK_TAU) / 3));
+    v[y * pw + x] = Math.max(-1, Math.min(1, (s - MASK_TAU) / 3)); if (s > MASK_TAU) pos++;
   }
   const r = rectFit(v, pw, Math.max(w, h) * f * 1.1);
-  if (!r || r.fill < 0.3) return null;               // mặt nạ quá rời rạc -> coi như chưa thấy thẻ
+  if (!r || r.fill < MIN_FILL) return null;           // mặt nạ không lấp đầy hình chữ nhật -> không phải thẻ
+  const ratio = pos / r.area;                          // mặt nạ phải xấp xỉ bằng hình chữ nhật khớp (thẻ thật ~1.0; tay/nền lan ra thì lệch)
+  if (ratio < 0.7 || ratio > 1.35) return null;
   {   // độ nét của vùng thẻ (trung bình độ chênh lệch giữa điểm ảnh kề nhau); khung bị nhòe do rung tay sẽ có điểm thấp
     const xs = r.pts.map(p => p[0] / f), ys = r.pts.map(p => p[1] / f), px = L.px, W = CARD_SZ;
     const xa = Math.max(1, Math.floor(Math.min(...xs))), xb = Math.min(W - 2, Math.ceil(Math.max(...xs)));
@@ -183,7 +185,9 @@ async function detectCard(src, sw, sh) {
     for (let y = ya; y < yb; y += 2) for (let x = xa; x < xb; x += 2) { const i = 4 * (y * W + x) + 1; sum += Math.abs(px[i] - px[i + 4]) + Math.abs(px[i] - px[i + 4 * W]); cnt++; }
     lastSharp = cnt ? sum / cnt : 0;
   }
-  return r.pts.map(([x, y]) => [(x / f - L.dx) / L.r, (y / f - L.dy) / L.r]);
+  const out = r.pts.map(([x, y]) => [(x / f - L.dx) / L.r, (y / f - L.dy) / L.r]);
+  if (Math.hypot(out[1][0] - out[0][0], out[1][1] - out[0][1]) < 0.2 * Math.min(sw, sh)) return null;   // quá nhỏ, nhiều khả năng là nhiễu
+  return out;
 }
 
 // ---------- 2. nắn phẳng (perspective transform tự viết, không cần OpenCV) ----------
@@ -427,6 +431,7 @@ async function readCard(frame, q, auto) {
     if (val.id.length === 12 && validDob(val.dob) && !consistent(val.id, val.dob)) w.push('số CCCD không khớp ngày sinh');
     $('fi').classList.toggle('bad', val.id.length !== 12); $('fd').classList.toggle('bad', !validDob(val.dob));
     const miss = FIELDS.filter(k => !boxes[k]);
+    if (miss.length === FIELDS.length) { out.style.display = 'none'; lastOk = false; if (auto) armed = false; st('Vật trong khung không phải CCCD (không thấy số, tên, ngày sinh).'); busy = false; $('bRead').disabled = !live; return; }
     st(miss.length ? 'Không thấy vùng: ' + miss.join(', ') + '. Hãy nhập tay hoặc chụp lại.'
       : w.length ? 'Đã đọc nhưng cần kiểm tra: ' + w.join('; ') + '.' : 'Xong. Kiểm tra và sửa nếu cần.');
     lastOk = !miss.length && !w.length;
@@ -456,19 +461,21 @@ async function loop() {
         if (pr) {   // độ xê dịch so với lần dò trước, tính theo bề rộng thẻ: dưới 10% là "chưa di chuyển mạnh", tay run nhẹ vẫn qua
           const mv = det.reduce((t, p, i) => t + Math.hypot(p[0] - pr[i][0], p[1] - pr[i][1]), 0) / 4 / cw;
           stable = mv < 0.10 ? stable + 1 : 0;
+          seen = mv < 0.35 ? seen + 1 : 1;                // khung nhảy lung tung -> đếm lại từ đầu
           if (prev && mv < 0.3) raw = det.map((p, i) => [prev[i][0] * .5 + p[0] * .5, prev[i][1] * .5 + p[1] * .5]);   // chỉ để vẽ cho đỡ rung
-        } else stable = 0;
+        } else { stable = 0; seen = 1; }
         pr = det;
         // giữ lại khung nét nhất trong ~0.7 giây gần nhất; khi đọc sẽ dùng khung này thay vì khung đúng lúc bấm
         const now = Date.now();
-        if (big && (!bfReady || lastSharp > bestScore || now - bestT > 700)) {
+        if (big && seen >= SHOW_NEED && (!bfReady || lastSharp > bestScore || now - bestT > 700)) {
           if (bf.width !== v.videoWidth || bf.height !== v.videoHeight) { bf.width = v.videoWidth; bf.height = v.videoHeight; }
           bf.getContext('2d').drawImage(v, 0, 0); bestQ = det; bestScore = lastSharp; bestT = now; bfReady = true;
         }
       } else if (prev && ++miss <= 2) raw = prev;      // rớt 1-2 khung thì giữ khung cũ, tránh nhấp nháy
-      else { stable = 0; pr = null; }
+      else { stable = 0; seen = 0; pr = null; }
       quad = prev = raw;
-    } catch (e) { quad = null; }
+      if (seen < SHOW_NEED) quad = null;               // chưa đủ số khung liên tiếp thì coi như chưa có thẻ
+    } catch (e) { quad = null; seen = 0; }
     busy = false;
     ov.width = v.videoWidth; ov.height = v.videoHeight;
     const g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height);
